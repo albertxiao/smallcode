@@ -6,7 +6,6 @@
     "smallcode": "bin/smallcode.js"
   },
   "scripts": {
-    "build": "node build.js",
     "start": "node bin/smallcode.js",
     "dev": "node bin/smallcode.js",
     "eval": "node bin/smallcode.js --eval classify_accuracy",
