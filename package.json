@@ -13,12 +13,12 @@
     "mcp": "node bin/smallcode.js --mcp"
   },
   "dependencies": {
-    "bonescript-compiler": "^0.14.0",
-    "budget-aware-mcp": "^0.6.1",
-    "chalk": "^4.1.2",
-    "cli-highlight": "^2.1.11",
-    "marked": "^15.0.12",
-    "marked-terminal": "^7.3.0"
+    "bonescript-compiler": "0.14.5",
+    "budget-aware-mcp": "0.6.1",
+    "chalk": "5.6.2",
+    "cli-highlight": "2.1.11",
+    "marked": "15.0.12",
+    "marked-terminal": "7.3.0"
   },
   "keywords": [
     "ai",
@@ -35,9 +35,9 @@
     "node": ">=18.0.0"
   },
   "devDependencies": {
-    "@types/node": "^25.8.0",
-    "jest": "^30.4.2",
-    "ts-node": "^10.9.2",
-    "typescript": "^6.0.3"
+    "@types/node": "25.9.0",
+    "jest": "30.4.2",
+    "ts-node": "10.9.2",
+    "typescript": "6.0.3"
   }
 }
