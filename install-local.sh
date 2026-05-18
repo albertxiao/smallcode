@@ -2,6 +2,6 @@
 set -e
 
 echo "Reinstalling smallcode from local fork..."
-npm install
+npm ci
 npm install -g .
 echo "Done. Run: smallcode --help"
