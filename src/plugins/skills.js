@@ -5,6 +5,7 @@
 // Skill locations:
 //   .smallcode/skills/   — project-level
 //   ~/.config/smallcode/skills/  — user-level (global)
+//   <package>/skills/    — bundled defaults (lowest priority)
 //
 // Skill format (markdown with YAML frontmatter):
 // ---
@@ -39,6 +40,7 @@ class SkillManager {
     return [
       path.join(this.projectDir, '.smallcode', 'skills'),
       path.join(os.homedir(), '.config', 'smallcode', 'skills'),
+      path.join(__dirname, '..', '..', 'skills'),
     ];
   }
 
@@ -60,14 +62,8 @@ class SkillManager {
     // Parse YAML frontmatter
     const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
     if (!fmMatch) {
-      // No frontmatter — treat entire file as the skill body
-      return {
-        name: filename.replace('.md', ''),
-        trigger: 'manual',
-        keywords: [],
-        content: content.trim(),
-        path: path.join(dir, filename),
-      };
+      // No frontmatter — not a skill (could be a README or doc file)
+      return null;
     }
 
     const frontmatter = fmMatch[1];

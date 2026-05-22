@@ -2,7 +2,8 @@
 // When user mentions "fix tests", "fix the bug", "what changed", etc.
 // automatically include recent git diff as context
 
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
+const { sanitizeToolOutput } = require('../security/sanitize');
 
 /**
  * Detect if the user's message implies they want context about recent changes.
@@ -25,23 +26,28 @@ function shouldInjectGitContext(message) {
  * Returns formatted string for injection, or empty string.
  */
 function getGitDiffContext(cwd, maxLines = 100) {
+  // Use execFileSync with arg arrays — never a shell — so the cwd path
+  // (which can contain spaces or unusual characters) cannot be misinterpreted.
+  const opts = { cwd, encoding: 'utf-8', timeout: 5000 };
   try {
-    // Check if we're in a git repo
-    execSync('git rev-parse --git-dir', { cwd, encoding: 'utf-8', timeout: 3000 });
+    execFileSync('git', ['rev-parse', '--git-dir'], { ...opts, timeout: 3000 });
   } catch {
     return '';
   }
 
   let diff = '';
   try {
-    // Unstaged changes
-    const unstaged = execSync('git diff --stat --no-color', { cwd, encoding: 'utf-8', timeout: 5000 }).trim();
+    const unstaged = execFileSync('git', ['diff', '--stat', '--no-color'], opts).trim();
     if (unstaged) {
-      diff += `Unstaged changes:\n${unstaged}\n\n`;
-      // Get actual diff (limited)
-      const fullDiff = execSync('git diff --no-color', { cwd, encoding: 'utf-8', timeout: 5000 });
+      // Cap --stat output to 40 lines (large repos can have thousands of changed files)
+      const statLines = unstaged.split('\n');
+      const cappedStat = statLines.length > 40
+        ? statLines.slice(0, 40).join('\n') + `\n... (${statLines.length - 40} more files)`
+        : unstaged;
+      diff += `Unstaged changes:\n${sanitizeToolOutput(cappedStat)}\n\n`;
+      const fullDiff = execFileSync('git', ['diff', '--no-color'], opts);
       const lines = fullDiff.split('\n').slice(0, maxLines);
-      diff += lines.join('\n');
+      diff += sanitizeToolOutput(lines.join('\n'));
       if (fullDiff.split('\n').length > maxLines) {
         diff += `\n... (${fullDiff.split('\n').length - maxLines} more lines)`;
       }
@@ -49,18 +55,16 @@ function getGitDiffContext(cwd, maxLines = 100) {
   } catch {}
 
   try {
-    // Staged changes
-    const staged = execSync('git diff --cached --stat --no-color', { cwd, encoding: 'utf-8', timeout: 5000 }).trim();
+    const staged = execFileSync('git', ['diff', '--cached', '--stat', '--no-color'], opts).trim();
     if (staged && !diff.includes(staged)) {
-      diff += `\nStaged changes:\n${staged}\n`;
+      diff += `\nStaged changes:\n${sanitizeToolOutput(staged)}\n`;
     }
   } catch {}
 
   try {
-    // Last commit message (for context on what was just done)
-    const lastCommit = execSync('git log --oneline -1', { cwd, encoding: 'utf-8', timeout: 3000 }).trim();
+    const lastCommit = execFileSync('git', ['log', '--oneline', '-1'], { ...opts, timeout: 3000 }).trim();
     if (lastCommit) {
-      diff += `\nLast commit: ${lastCommit}\n`;
+      diff += `\nLast commit: ${sanitizeToolOutput(lastCommit)}\n`;
     }
   } catch {}
 

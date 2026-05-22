@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# E2E test artifacts (generated, not committed)
+.e2e-test/
+
 # SmallCode runtime state
 .smallcode/cache/
 .smallcode/traces/
@@ -55,6 +58,21 @@ desktop.ini
 .env
 .env.local
 
+# Test workspaces (generated during dev/testing)
+.test-runs/
+.test-workspace/
+
+# Benchmark output (generated per run, stored in .smallcode/benchmarks/)
+.smallcode/benchmarks/
+.smallcode/snapshots/
+
 # MarrowScript source (internal, not shipped)
+# All .marrow files are excluded from git by default.
+# Use explicit negation patterns to include specific ones.
 *.marrow
 marrow.toml
+
+# Include specific marrow source files that are part of the shipped package
+!marrow/smallcode_cognition.marrow
+!marrow/tool_router.marrow
+!marrow/bounded_loops.marrow

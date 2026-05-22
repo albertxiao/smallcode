@@ -1,7 +1,7 @@
 // SmallCode — Governor Module (ARK-inspired)
 // Wires into the agent loop: tool scoring, verification, hard fail
 
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -76,20 +76,24 @@ function verifyCode(filePath) {
   const ext = path.extname(filePath);
   const result = { passed: false, confidence: 0, compiled: false, executed: false, errors: [] };
 
-  // Compile check
-  let compileCmd;
+  // Compile check (use execFileSync with args array to avoid shell injection
+  // via a crafted filePath like `evil.py; rm -rf /`).
+  let compileExec = null; // [cmd, args]
   switch (ext) {
-    case '.py': compileCmd = `python -m py_compile "${fullPath}"`; break;
-    case '.js': case '.mjs': compileCmd = `node --check "${fullPath}"`; break;
-    case '.ts': case '.tsx': compileCmd = `npx tsc --noEmit "${fullPath}" 2>&1`; break;
-    case '.go': compileCmd = `go build "${fullPath}" 2>&1`; break;
-    case '.json': try { JSON.parse(fs.readFileSync(fullPath, 'utf-8')); result.compiled = true; } catch (e) { result.errors.push(e.message); } break;
+    case '.py': compileExec = ['python', ['-m', 'py_compile', fullPath]]; break;
+    case '.js': case '.mjs': compileExec = ['node', ['--check', fullPath]]; break;
+    case '.ts': case '.tsx': compileExec = ['npx', ['tsc', '--noEmit', fullPath]]; break;
+    case '.go': compileExec = ['go', ['build', fullPath]]; break;
+    case '.json':
+      try { JSON.parse(fs.readFileSync(fullPath, 'utf-8')); result.compiled = true; }
+      catch (e) { result.errors.push(e.message); }
+      break;
     default: result.compiled = true; // Can't check, assume ok
   }
 
-  if (compileCmd) {
+  if (compileExec) {
     try {
-      execSync(compileCmd, { encoding: 'utf-8', timeout: 15000, cwd: process.cwd() });
+      execFileSync(compileExec[0], compileExec[1], { encoding: 'utf-8', timeout: 15000, cwd: process.cwd() });
       result.compiled = true;
     } catch (e) {
       result.errors.push((e.stdout || e.stderr || e.message || '').slice(0, 500));
@@ -101,9 +105,9 @@ function verifyCode(filePath) {
     const content = fs.readFileSync(fullPath, 'utf-8');
     const hasMainGuard = content.includes('__name__') || content.includes('main()') || content.includes('console.log');
     if (hasMainGuard) {
-      const runCmd = ext === '.py' ? `python "${fullPath}"` : `node "${fullPath}"`;
+      const runExec = ext === '.py' ? ['python', [fullPath]] : ['node', [fullPath]];
       try {
-        execSync(runCmd, { encoding: 'utf-8', timeout: 10000, cwd: process.cwd() });
+        execFileSync(runExec[0], runExec[1], { encoding: 'utf-8', timeout: 10000, cwd: process.cwd() });
         result.executed = true;
       } catch (e) {
         result.errors.push(`Runtime error: ${(e.stderr || e.message || '').slice(0, 300)}`);
@@ -125,9 +129,19 @@ function verifyCode(filePath) {
 
 const MAX_VERIFICATION_RETRIES = 2;
 const verificationHistory = {}; // filePath → [results]
+const MAX_TRACKED_FILES = 50; // Prevent unbounded growth
 
 function checkAndEnforceHardFail(filePath) {
   if (!verificationHistory[filePath]) verificationHistory[filePath] = [];
+
+  // Bound the history: if we're tracking too many files, drop the oldest
+  const trackedFiles = Object.keys(verificationHistory);
+  if (trackedFiles.length > MAX_TRACKED_FILES) {
+    // Remove the first N entries (oldest by insertion order)
+    for (const k of trackedFiles.slice(0, trackedFiles.length - MAX_TRACKED_FILES)) {
+      delete verificationHistory[k];
+    }
+  }
   
   const result = verifyCode(filePath);
   verificationHistory[filePath].push(result);
@@ -213,6 +227,8 @@ Error that won't go away: ${errors[0] || 'unknown'}`,
 
 // ─── Task Classifier ─────────────────────────────────────────────────────────
 
+// Synchronous regex-based classifier (fast, deterministic, no LLM)
+// Used as default for fast tasks and as fallback for the LLM-based one.
 function classifyTask(userMessage) {
   const msg = userMessage.toLowerCase();
   // Detect backend/API tasks that should use BoneScript — ONLY for Node.js/TypeScript backends
@@ -235,4 +251,17 @@ function classifyTask(userMessage) {
   return 'coding'; // default
 }
 
-module.exports = { ToolScorer, verifyCode, checkAndEnforceHardFail, classifyTask, verificationHistory, pickDecomposeStrategy };
+// Async classifier — uses MarrowScript-compiled cognition layer with caching,
+// validation, retries, and tracing. Falls back to regex classifier on failure.
+// Use this when latency budget allows (~200-500ms for a TinyClassifier call,
+// 0ms on cache hit).
+async function classifyTaskAsync(userMessage) {
+  try {
+    const { classifyTaskCompiled } = require('./cognition_adapter');
+    return await classifyTaskCompiled(userMessage, { fallback: classifyTask });
+  } catch {
+    return classifyTask(userMessage);
+  }
+}
+
+module.exports = { ToolScorer, verifyCode, checkAndEnforceHardFail, classifyTask, classifyTaskAsync, verificationHistory, pickDecomposeStrategy };

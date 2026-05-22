@@ -11,6 +11,74 @@
 
 const readline = require('readline');
 
+// ─── Visual Width Helpers ─────────────────────────────────────────────────────
+// CJK and fullwidth characters occupy 2 columns in the terminal, not 1.
+// Using string.length for layout/cursor breaks when input contains CJK text.
+
+function visualWidth(ch) {
+  const cp = ch.codePointAt(0);
+  if (!cp) return 0;
+  if (cp >= 0x1100 && (
+    cp <= 0x115F ||                    // Hangul Jamo
+    (cp >= 0x2E80 && cp <= 0xA4CF) ||  // CJK Radicals, Kangxi, Ideographic Description, CJK Symbols, Hiragana, Katakana, Bopomofo, etc.
+    (cp >= 0xA960 && cp <= 0xA97C) ||  // Hangul Jamo Extended-A
+    (cp >= 0xAC00 && cp <= 0xD7AF) ||  // Hangul Syllables
+    (cp >= 0xF900 && cp <= 0xFAFF) ||  // CJK Compatibility Ideographs
+    (cp >= 0xFE10 && cp <= 0xFE19) ||  // Vertical Forms
+    (cp >= 0xFE30 && cp <= 0xFE6F) ||  // CJK Compatibility Forms
+    (cp >= 0xFF01 && cp <= 0xFF60) ||  // Fullwidth Forms
+    (cp >= 0xFFE0 && cp <= 0xFFE6) ||  // Fullwidth Signs
+    (cp >= 0x20000 && cp <= 0x2FFFF) || // CJK Unified Ideographs Extension B-F
+    (cp >= 0x30000 && cp <= 0x3FFFF)   // CJK Unified Ideographs Extension G-H
+  )) return 2;
+  return 1;
+}
+
+function visualLength(str) {
+  let len = 0;
+  for (const ch of str) len += visualWidth(ch);
+  return len;
+}
+
+// Split string into visual lines, each no wider than maxVisualWidth.
+function visualWrap(str, maxVisualWidth) {
+  if (str.length === 0) return [''];
+  const lines = [];
+  let current = '';
+  let curWidth = 0;
+  for (const ch of str) {
+    const w = visualWidth(ch);
+    if (curWidth + w > maxVisualWidth) {
+      lines.push(current);
+      current = ch;
+      curWidth = w;
+    } else {
+      current += ch;
+      curWidth += w;
+    }
+  }
+  if (current.length > 0) lines.push(current);
+  return lines;
+}
+
+// Compute cursor visual (line, col) from character index into str.
+function visualCursorPosition(str, cursorIdx, maxVisualWidth) {
+  let line = 0;
+  let col = 0;
+  let charIdx = 0;
+  for (const ch of str) {
+    if (charIdx >= cursorIdx) break;
+    const w = visualWidth(ch);
+    if (col + w > maxVisualWidth) {
+      line++;
+      col = 0;
+    }
+    col += w;
+    charIdx++;
+  }
+  return { line, col };
+}
+
 // ─── ANSI Escape Sequences ───────────────────────────────────────────────────
 
 const ESC = '\x1b[';
@@ -128,18 +196,26 @@ class FullScreenTUI {
     // Command palette
     this.commandPaletteOpen = false;
     this.commandPaletteSelection = 0;
+    this._paletteScrollOffset = 0;
     this.commands = [
       { cmd: '/quit', alias: '/q', desc: 'Exit SmallCode' },
       { cmd: '/clear', alias: null, desc: 'Reset conversation' },
       { cmd: '/model', alias: null, desc: 'Show/switch model' },
       { cmd: '/endpoint', alias: null, desc: 'Switch API endpoint' },
       { cmd: '/stats', alias: null, desc: 'Session statistics' },
+      { cmd: '/tokens', alias: null, desc: 'Token usage report' },
+      { cmd: '/budget', alias: null, desc: 'Context window budget' },
       { cmd: '/files', alias: null, desc: 'List project files' },
       { cmd: '/diff', alias: null, desc: 'Git diff summary' },
       { cmd: '/git', alias: null, desc: 'Run git command' },
       { cmd: '/loop', alias: null, desc: 'Validate + auto-fix file' },
       { cmd: '/memory', alias: null, desc: 'View project memory' },
+      { cmd: '/trace', alias: null, desc: 'View execution traces' },
+      { cmd: '/eval', alias: null, desc: 'Run prompt evaluation' },
       { cmd: '/escalation', alias: null, desc: 'Model escalation status' },
+      { cmd: '/profile', alias: null, desc: 'Model profile + routing' },
+      { cmd: '/cognition', alias: null, desc: 'MarrowScript cognition status' },
+      { cmd: '/mcp', alias: null, desc: 'Connected MCP servers' },
       { cmd: '/skill', alias: null, desc: 'Manage reusable skills' },
       { cmd: '/plugin', alias: null, desc: 'Manage plugins' },
       { cmd: '/sessions', alias: null, desc: 'List/resume sessions' },
@@ -182,8 +258,8 @@ class FullScreenTUI {
     // Store a direct reference to the real stdout.write (before any overrides)
     this._rawWrite = process.stdout.write.bind(process.stdout);
 
-    // Enter alternate buffer + raw mode + enable mouse SGR reporting + bracketed paste
-    this._rawWrite(ANSI.enterAlt + ANSI.hideCursor + '\x1b[?1006h' + '\x1b[?2004h');
+    // Enter alternate buffer + raw mode + mouse tracking (hold Shift to select text) + SGR encoding + bracketed paste
+    this._rawWrite(ANSI.enterAlt + ANSI.hideCursor + '\x1b[?1000h' + '\x1b[?1006h' + '\x1b[?2004h');
     process.stdin.setRawMode(true);
     process.stdin.resume();
 
@@ -200,7 +276,7 @@ class FullScreenTUI {
   leave() {
     this.active = false;
     const write = this._rawWrite || process.stdout.write.bind(process.stdout);
-    write(ANSI.showCursor + '\x1b[?1006l' + '\x1b[?2004l' + ANSI.leaveAlt + ANSI.reset);
+    write(ANSI.showCursor + '\x1b[?1000l' + '\x1b[?1006l' + '\x1b[?2004l' + ANSI.leaveAlt + ANSI.reset);
     process.stdin.setRawMode(false);
     process.stdin.pause();
   }
@@ -211,11 +287,17 @@ class FullScreenTUI {
     this.width = process.stdout.columns || 80;
     this.height = process.stdout.rows || 24;
 
+    // Dynamic input height: grows with content (min 3, max 8 lines)
+    const inputAvail = this.width - 5;
+    const inputVisualLen = visualLength(this.inputBuffer);
+    const wrappedLines = inputAvail > 0 ? Math.ceil(Math.max(1, inputVisualLen) / inputAvail) : 1;
+    this.inputHeight = Math.min(8, Math.max(3, wrappedLines + 2)); // +2 for border + hint
+
     this.chatHeight = this.height - this.inputHeight - this.statusHeight;
 
     if (this.showToolPanel && this.width > 100) {
       this.chatWidth = Math.floor(this.width * 0.65);
-      this.toolWidth = this.width - this.chatWidth - 1; // 1 for divider
+      this.toolWidth = this.width - this.chatWidth - 1;
     } else {
       this.chatWidth = this.width;
       this.toolWidth = 0;
@@ -226,6 +308,7 @@ class FullScreenTUI {
 
   render() {
     if (!this.active) return;
+    this._computeLayout(); // Recalculate in case input grew/shrunk
 
     let buf = '';
 
@@ -246,13 +329,11 @@ class FullScreenTUI {
     // Status bar
     buf += this._renderStatus();
 
-    // Position cursor in input
-    const inputRow = this.chatHeight + 2; // +1 for border, +1 for 1-index
+    // Position cursor in wrapped input (visual-width-aware)
     const inputAvail = this.width - 5;
-    const scrollOffset = this.inputBuffer.length > inputAvail
-      ? Math.max(0, this.inputCursor - inputAvail + 5)
-      : 0;
-    const inputCol = 5 + (this.inputCursor - scrollOffset); // "│ > " prefix + visible cursor pos
+    const pos = visualCursorPosition(this.inputBuffer, this.inputCursor, inputAvail);
+    const inputRow = this.chatHeight + 2 + pos.line; // +1 border, +1 for 1-index
+    const inputCol = 5 + pos.col; // "│ > " prefix
     buf += ANSI.moveTo(inputRow, inputCol) + ANSI.showCursor;
 
     this._rawWrite(buf);
@@ -323,7 +404,7 @@ class FullScreenTUI {
 
     // Version below logo
     const versionRow = startRow + logoLines.length + 1;
-    const versionText = `v0.2.0`;
+    const versionText = `v${require('../../package.json').version}`;
     const versionPad = Math.max(0, Math.floor((w - logoWidth) / 2) + logoWidth - versionText.length);
     buf += ANSI.moveTo(versionRow, versionPad + 1);
     buf += t.muted + versionText + ANSI.reset;
@@ -400,28 +481,40 @@ class FullScreenTUI {
     buf += ANSI.moveTo(row, 1);
     buf += t.border + BOX.horizontal.repeat(this.width) + ANSI.reset;
 
-    // Input line — left border accent + clean input
-    const inputAvail = this.width - 5; // "│ > " prefix
-    buf += ANSI.moveTo(row + 1, 1);
-    buf += t.inputBg + t.border + BOX.vertical + ANSI.reset + t.inputBg;
-    buf += t.muted + ' > ' + ANSI.reset + t.inputBg + t.fg;
+    // Input area — wraps vertically for long text
+    const inputAvail = this.width - 5; // "│ > " prefix / "│   " continuation
+    const inputLines = visualWrap(this.inputBuffer, inputAvail);
 
-    // Show the visible portion of input (scroll horizontally if too long)
-    let visibleInput = this.inputBuffer;
-    if (this.inputBuffer.length > inputAvail) {
-      const scrollOffset = Math.max(0, this.inputCursor - inputAvail + 5);
-      visibleInput = this.inputBuffer.slice(scrollOffset, scrollOffset + inputAvail);
+    // Render each wrapped line
+    for (let i = 0; i < inputLines.length && i < 6; i++) {
+      buf += ANSI.moveTo(row + 1 + i, 1);
+      buf += t.inputBg + t.border + BOX.vertical + ANSI.reset + t.inputBg;
+      if (i === 0) {
+        buf += t.muted + ' > ' + ANSI.reset + t.inputBg + t.fg;
+      } else {
+        buf += '   ' + t.inputBg + t.fg;
+      }
+      buf += inputLines[i];
+      const lineVisualLen = visualLength(inputLines[i]);
+      buf += ' '.repeat(Math.max(0, inputAvail - lineVisualLen));
+      buf += ANSI.reset;
     }
-    buf += visibleInput;
-    buf += ' '.repeat(Math.max(0, inputAvail - visibleInput.length));
-    buf += ANSI.reset;
+
+    // Clear remaining input area lines
+    for (let i = inputLines.length; i < this.inputHeight - 2; i++) {
+      buf += ANSI.moveTo(row + 1 + i, 1);
+      buf += ' '.repeat(this.width);
+    }
 
     // Hint line
-    buf += ANSI.moveTo(row + 2, 1);
+    const hintRow = row + this.inputHeight - 1;
+    buf += ANSI.moveTo(hintRow, 1);
     if (this.commandPaletteOpen) {
       buf += t.muted + '  ↑↓ navigate  enter select  esc cancel' + ANSI.reset;
+    } else if (inputLines.length > 1) {
+      buf += t.muted + `  ${this.inputBuffer.length} chars` + ANSI.reset;
     } else {
-      buf += t.muted + '' + ANSI.reset; // Clean — no hint clutter
+      buf += t.muted + '' + ANSI.reset;
     }
 
     return buf;
@@ -436,44 +529,62 @@ class FullScreenTUI {
 
     if (filtered.length === 0) return '';
 
-    // Clamp selection
+    // Clamp selection to valid range
     this.commandPaletteSelection = Math.max(0, Math.min(this.commandPaletteSelection, filtered.length - 1));
 
-    // Calculate palette dimensions
-    const maxVisible = Math.min(filtered.length, 10);
+    // Calculate how many items can fit above the input box
+    // Leave 2 rows for the top/bottom borders of the palette box + 1 buffer row
+    const availableRows = inputRow - 3;
+    const maxVisible = Math.max(1, Math.min(filtered.length, availableRows, 12));
+    this._paletteMaxVisible = maxVisible; // Store for arrow key handler
+
+    // Keep scroll offset in sync with selection
+    if (this.commandPaletteSelection < this._paletteScrollOffset) {
+      this._paletteScrollOffset = this.commandPaletteSelection;
+    } else if (this.commandPaletteSelection >= this._paletteScrollOffset + maxVisible) {
+      this._paletteScrollOffset = this.commandPaletteSelection - maxVisible + 1;
+    }
+    this._paletteScrollOffset = Math.max(0, Math.min(this._paletteScrollOffset, filtered.length - maxVisible));
+
     const paletteWidth = Math.min(this.width - 4, 50);
     const startRow = inputRow - maxVisible - 1;
+    const hasMore = filtered.length > maxVisible;
 
-    // Draw palette box
+    // Draw top border (with count if scrollable)
     buf += ANSI.moveTo(startRow, 2);
-    buf += this.theme.border + BOX.rTopLeft + BOX.horizontal.repeat(paletteWidth - 2) + BOX.rTopRight + ANSI.reset;
+    const countLabel = hasMore ? ` ${this._paletteScrollOffset + 1}-${Math.min(this._paletteScrollOffset + maxVisible, filtered.length)}/${filtered.length} ` : '';
+    const topFill = paletteWidth - 2 - countLabel.length;
+    buf += this.theme.border + BOX.rTopLeft + BOX.horizontal.repeat(Math.max(0, topFill)) + (hasMore ? this.theme.muted + countLabel + this.theme.border : '') + BOX.rTopRight + ANSI.reset;
 
+    // Draw visible items (windowed by scroll offset)
     for (let i = 0; i < maxVisible; i++) {
-      const cmd = filtered[i];
-      const isSelected = i === this.commandPaletteSelection;
+      const itemIdx = i + this._paletteScrollOffset;
+      if (itemIdx >= filtered.length) break;
+      const cmd = filtered[itemIdx];
+      const isSelected = itemIdx === this.commandPaletteSelection;
       const row = startRow + 1 + i;
 
       buf += ANSI.moveTo(row, 2);
       buf += this.theme.border + BOX.vertical + ANSI.reset;
 
-      if (isSelected) {
-        buf += ANSI.inverse;
-      }
+      if (isSelected) buf += ANSI.inverse;
 
       const cmdText = cmd.cmd + (cmd.alias ? ` (${cmd.alias})` : '');
-      const descText = cmd.desc;
-      const line = ` ${cmdText.padEnd(16)} ${descText}`;
+      const line = ` ${cmdText.padEnd(16)} ${cmd.desc}`;
       buf += (isSelected ? this.theme.accent : this.theme.fg) + line.slice(0, paletteWidth - 3).padEnd(paletteWidth - 3);
 
-      if (isSelected) {
-        buf += ANSI.reset;
-      }
-
+      if (isSelected) buf += ANSI.reset;
       buf += ANSI.reset + this.theme.border + BOX.vertical + ANSI.reset;
     }
 
+    // Draw bottom border (with scroll hint if there are hidden items below)
     buf += ANSI.moveTo(startRow + maxVisible + 1, 2);
-    buf += this.theme.border + BOX.rBottomLeft + BOX.horizontal.repeat(paletteWidth - 2) + BOX.rBottomRight + ANSI.reset;
+    const scrollHint = hasMore && this._paletteScrollOffset + maxVisible < filtered.length ? ' ↓ more' : '';
+    const scrollHintUp = hasMore && this._paletteScrollOffset > 0 ? ' ↑ ' : '';
+    buf += this.theme.border + BOX.rBottomLeft + BOX.horizontal.repeat(Math.max(0, paletteWidth - 2 - scrollHint.length - scrollHintUp.length));
+    if (scrollHintUp) buf += this.theme.muted + scrollHintUp + this.theme.border;
+    if (scrollHint) buf += this.theme.muted + scrollHint + this.theme.border;
+    buf += BOX.rBottomRight + ANSI.reset;
 
     return buf;
   }
@@ -486,13 +597,18 @@ class FullScreenTUI {
     buf += ANSI.moveTo(row, 1);
     buf += t.statusBg;
 
-    const left = ` enter send`;
+    // Dynamic status message (e.g. spinner during model call) overrides left hint
+    const left = this.statusMsg
+      ? ` ${this.statusMsg}`
+      : ` enter send  shift+drag copy`;
     const scrollInfo = this.chatScroll < 0 ? `  ↑ scrolled` : '';
     const tokenStr = this.tokenInfo ? `  ${this.tokenInfo}` : '';
     const right = ` smallcode  ${this.model}  ${this.isStreaming ? '⟳' : '●'} `;
     const padding = this.width - left.length - scrollInfo.length - tokenStr.length - right.length;
 
-    buf += t.muted + left + ANSI.reset + t.statusBg;
+    // Color the status message differently when it contains a spinner frame
+    const leftColor = this.statusMsg ? (t.accent || t.muted) : t.muted;
+    buf += leftColor + left + ANSI.reset + t.statusBg;
     if (scrollInfo) {
       buf += (t.warning || t.muted) + scrollInfo + ANSI.reset + t.statusBg;
     }
@@ -501,6 +617,12 @@ class FullScreenTUI {
     buf += t.brandDim + right + ANSI.reset;
 
     return buf;
+  }
+
+  /** Set a transient status message shown in the status bar. Pass '' to clear. */
+  setStatus(msg) {
+    this.statusMsg = msg || '';
+    this.render();
   }
 
   // ─── Input Handling ──────────────────────────────────────────────────
@@ -552,6 +674,7 @@ class FullScreenTUI {
         }
         this.commandPaletteOpen = false;
         this.commandPaletteSelection = 0;
+        this._paletteScrollOffset = 0;
         // Fall through to execute the command below (don't return)
       }
 
@@ -577,6 +700,7 @@ class FullScreenTUI {
     if (key === '\x1b' && this.commandPaletteOpen) {
       this.commandPaletteOpen = false;
       this.commandPaletteSelection = 0;
+      this._paletteScrollOffset = 0;
       this.render();
       return;
     }
@@ -602,6 +726,10 @@ class FullScreenTUI {
     if (key === '\x1b[A') { // Up — history or palette navigation
       if (this.commandPaletteOpen) {
         this.commandPaletteSelection = Math.max(0, this.commandPaletteSelection - 1);
+        // Scroll offset: keep selection visible at top
+        if (this.commandPaletteSelection < this._paletteScrollOffset) {
+          this._paletteScrollOffset = this.commandPaletteSelection;
+        }
         this.render();
         return;
       }
@@ -615,7 +743,16 @@ class FullScreenTUI {
     }
     if (key === '\x1b[B') { // Down — history or palette navigation
       if (this.commandPaletteOpen) {
-        this.commandPaletteSelection++;
+        const filter = this.inputBuffer.slice(1).toLowerCase();
+        const filteredLen = this.commands.filter(c =>
+          c.cmd.slice(1).startsWith(filter) || (c.alias && c.alias.slice(1).startsWith(filter))
+        ).length;
+        this.commandPaletteSelection = Math.min(filteredLen - 1, this.commandPaletteSelection + 1);
+        // Scroll offset: keep selection visible at bottom
+        const maxVis = this._paletteMaxVisible || 8;
+        if (this.commandPaletteSelection >= this._paletteScrollOffset + maxVis) {
+          this._paletteScrollOffset = this.commandPaletteSelection - maxVis + 1;
+        }
         this.render();
         return;
       }
@@ -710,8 +847,10 @@ class FullScreenTUI {
         if (this.inputBuffer.startsWith('/')) {
           this.commandPaletteOpen = true;
           this.commandPaletteSelection = 0;
+          this._paletteScrollOffset = 0;
         } else {
           this.commandPaletteOpen = false;
+          this._paletteScrollOffset = 0;
         }
 
         this.render();
@@ -771,6 +910,15 @@ class FullScreenTUI {
     this.chatLines.push(''); // spacer
     this.chatScroll = 0; // snap to bottom
     this.msgCount++;
+
+    // Cap chatLines to prevent unbounded growth (keep last 5000 lines).
+    // A very long session with verbose tool output can accumulate tens of
+    // thousands of lines; rendering stays fast by only keeping recent history.
+    const MAX_CHAT_LINES = 5000;
+    if (this.chatLines.length > MAX_CHAT_LINES) {
+      this.chatLines.splice(0, this.chatLines.length - MAX_CHAT_LINES);
+    }
+
     this.render();
   }
 

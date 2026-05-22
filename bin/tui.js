@@ -120,9 +120,11 @@ function renderStatus(config, historyLen) {
 // ─── Welcome banner ──────────────────────────────────────────────────────────
 
 function renderWelcome(config, graphOk) {
+  let version = '0.9.2';
+  try { version = require('../package.json').version; } catch {}
   const lines = [
     '',
-    chalk.bold.cyan('  ⚡ SmallCode') + chalk.gray(` v0.1.0`),
+    chalk.bold.cyan('  ⚡ SmallCode') + chalk.gray(` v${version}`),
     '',
     `  Model:    ${chalk.white(config.model.name)}`,
     `  Endpoint: ${chalk.gray(config.model.baseUrl)}`,

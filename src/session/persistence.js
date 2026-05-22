@@ -8,16 +8,25 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { redactValue } = require('../security/sanitize');
 
 const SESSIONS_DIR = '.smallcode/sessions';
 const MAX_SESSIONS = 50; // Keep last 50 sessions
+// File mode 0o600: owner read/write only — sessions contain conversation
+// history which can include path-traversal hints, project secrets that
+// leaked through tool output, and user prompts.
+const FILE_MODE = 0o600;
+const DIR_MODE = 0o700;
 
 class SessionStore {
   constructor(rootDir) {
     this.rootDir = rootDir || process.cwd();
     this.sessionsDir = path.join(this.rootDir, SESSIONS_DIR);
     if (!fs.existsSync(this.sessionsDir)) {
-      fs.mkdirSync(this.sessionsDir, { recursive: true });
+      fs.mkdirSync(this.sessionsDir, { recursive: true, mode: DIR_MODE });
+    } else {
+      // Tighten perms on existing dir (best-effort, ignored on Windows)
+      try { fs.chmodSync(this.sessionsDir, DIR_MODE); } catch {}
     }
     this.current = null;
   }
@@ -51,15 +60,32 @@ class SessionStore {
 
   // Load a specific session
   load(id) {
-    const filePath = path.join(this.sessionsDir, `${id}.json`);
-    if (!fs.existsSync(filePath)) return null;
-    try {
-      const session = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-      this.current = session;
-      return session;
-    } catch {
+    // Validate ID shape — only allow time-descending hex IDs we generate.
+    // Prevents path traversal via '../foo' or absolute paths.
+    if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
       return null;
     }
+    // Try exact match first
+    const filePath = path.join(this.sessionsDir, `${id}.json`);
+    // Containment guard — reject any resolved path that escapes the sessions dir.
+    if (!filePath.startsWith(this.sessionsDir + path.sep)) return null;
+    if (fs.existsSync(filePath)) {
+      try {
+        const session = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        this.current = session;
+        return session;
+      } catch { return null; }
+    }
+    // Try partial ID match (user may type short prefix from /sessions list)
+    try {
+      const files = fs.readdirSync(this.sessionsDir).filter(f => f.startsWith(id) && f.endsWith('.json'));
+      if (files.length === 1) {
+        const session = JSON.parse(fs.readFileSync(path.join(this.sessionsDir, files[0]), 'utf-8'));
+        this.current = session;
+        return session;
+      }
+    } catch {}
+    return null;
   }
 
   // Save current session state
@@ -106,7 +132,9 @@ class SessionStore {
 
   // Delete a session
   remove(id) {
+    if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(id)) return false;
     const filePath = path.join(this.sessionsDir, `${id}.json`);
+    if (!filePath.startsWith(this.sessionsDir + path.sep)) return false;
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
       return true;
@@ -133,12 +161,24 @@ class SessionStore {
 
   _save(session) {
     const filePath = path.join(this.sessionsDir, `${session.id}.json`);
-    fs.writeFileSync(filePath, JSON.stringify(session, null, 2));
+    // Redact secrets that may have leaked into messages or tool output before
+    // writing to disk. The redaction is one-way: stored sessions never carry
+    // raw API keys, bearer tokens, or env-style secret assignments.
+    const redacted = redactValue(session);
+    // Atomic write: write to a temp file then rename. Prevents reading a
+    // half-written session if the process crashes mid-save.
+    const tmpPath = filePath + `.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmpPath, JSON.stringify(redacted, null, 2), { mode: FILE_MODE });
+    fs.renameSync(tmpPath, filePath);
+    try { fs.chmodSync(filePath, FILE_MODE); } catch {}
   }
 
   _generateId() {
-    // Time-descending ID so newest sorts first lexicographically
-    const time = (9999999999999 - Date.now()).toString(36).padStart(9, '0');
+    // Time-descending ID so newest sorts first lexicographically.
+    // Use a wider epoch offset (good until year 2255) to avoid the overflow
+    // that the old (9999999999999 - Date.now()) formula would hit in 2033.
+    const MAX_TS = 9007199254740991; // Number.MAX_SAFE_INTEGER
+    const time = (MAX_TS - Date.now()).toString(36).padStart(11, '0');
     const rand = crypto.randomBytes(3).toString('hex');
     return `${time}-${rand}`;
   }

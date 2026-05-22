@@ -159,7 +159,7 @@ ${systemPromptExtra}`,
       const nonSystem = messages.filter(m => m.role !== 'system');
 
       // Convert tool results from OpenAI format
-      const anthropicMessages = nonSystem.map(m => {
+      const rawMessages = nonSystem.map(m => {
         if (m.role === 'tool') {
           return {
             role: 'user',
@@ -169,16 +169,47 @@ ${systemPromptExtra}`,
         if (m.tool_calls) {
           return {
             role: 'assistant',
-            content: m.tool_calls.map(tc => ({
-              type: 'tool_use',
-              id: tc.id,
-              name: tc.function.name,
-              input: JSON.parse(tc.function.arguments || '{}'),
-            })),
+            content: m.tool_calls.map(tc => {
+              let inputArgs = {};
+              try { inputArgs = JSON.parse(tc.function.arguments || '{}'); } catch { inputArgs = {}; }
+              return {
+                type: 'tool_use',
+                id: tc.id,
+                name: tc.function.name,
+                input: inputArgs,
+              };
+            }),
           };
         }
         return { role: m.role, content: m.content };
       });
+
+      // Fix #10: Anthropic requires alternating user/assistant. Merge consecutive
+      // same-role messages (common when SmallCode injects [AUTO-FIX], [SYSTEM],
+      // [DECOMPOSE] etc. as role:'user' back-to-back).
+      const anthropicMessages = [];
+      for (const msg of rawMessages) {
+        if (anthropicMessages.length > 0 && anthropicMessages[anthropicMessages.length - 1].role === msg.role) {
+          // Merge into previous message
+          const prev = anthropicMessages[anthropicMessages.length - 1];
+          if (typeof prev.content === 'string' && typeof msg.content === 'string') {
+            prev.content = prev.content + '\n\n' + msg.content;
+          } else if (Array.isArray(prev.content) && Array.isArray(msg.content)) {
+            prev.content = [...prev.content, ...msg.content];
+          } else if (typeof prev.content === 'string' && Array.isArray(msg.content)) {
+            prev.content = [{ type: 'text', text: prev.content }, ...msg.content];
+          } else if (Array.isArray(prev.content) && typeof msg.content === 'string') {
+            prev.content = [...prev.content, { type: 'text', text: msg.content }];
+          }
+        } else {
+          anthropicMessages.push({ ...msg });
+        }
+      }
+
+      // Ensure first message is from user (Anthropic requirement)
+      if (anthropicMessages.length > 0 && anthropicMessages[0].role !== 'user') {
+        anthropicMessages.unshift({ role: 'user', content: '(continuing from earlier context)' });
+      }
 
       // Convert tools to Anthropic format
       const anthropicTools = (tools || []).map(t => ({

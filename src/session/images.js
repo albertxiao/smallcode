@@ -7,8 +7,10 @@
 
 const fs = require('fs');
 const path = require('path');
+const { safeResolvePath } = require('../security/sanitize');
 
 const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'];
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB cap per image to prevent base64 context blow-up
 
 /**
  * Detect image file references in a message.
@@ -28,9 +30,16 @@ function extractImages(message, cwd) {
     const ext = path.extname(rawPath).toLowerCase();
     if (!IMAGE_EXTENSIONS.includes(ext)) continue;
     
-    const fullPath = path.resolve(cwd, rawPath);
+    const safe = safeResolvePath(rawPath, cwd);
+    if (!safe.ok) continue; // Block out-of-tree images and sensitive paths
+    const fullPath = safe.fullPath;
     if (!fs.existsSync(fullPath)) continue;
-    
+
+    let stat;
+    try { stat = fs.statSync(fullPath); } catch { continue; }
+    if (!stat.isFile() || stat.size === 0) continue;
+    if (stat.size > MAX_IMAGE_BYTES) continue; // Refuse oversized images
+
     try {
       const buffer = fs.readFileSync(fullPath);
       const base64 = buffer.toString('base64');

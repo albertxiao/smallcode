@@ -133,7 +133,7 @@ class LSPClient {
     });
 
     // Wait for diagnostics (published via notification)
-    return new Promise((resolve) => {
+    const diags = await new Promise((resolve) => {
       const timeout = setTimeout(() => resolve(this.diagnostics.get(uri) || []), 5000);
       const check = setInterval(() => {
         const diags = this.diagnostics.get(uri);
@@ -144,6 +144,12 @@ class LSPClient {
         }
       }, 200);
     });
+
+    // Close the document after reading diagnostics to prevent the language
+    // server from keeping it in memory indefinitely (Fix #20).
+    this._notify('textDocument/didClose', { textDocument: { uri } });
+
+    return diags;
   }
 
   // Format diagnostics as readable errors

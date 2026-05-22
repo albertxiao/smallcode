@@ -32,7 +32,7 @@ class ACPAdapter {
       type: 'agent.capabilities',
       capabilities: this.capabilities,
       name: 'SmallCode',
-      version: '0.2.7',
+      version: require('../../package.json').version,
     });
 
     rl.on('line', async (line) => {

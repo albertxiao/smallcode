@@ -1,10 +1,13 @@
 # SmallCode default configuration
 
 [model]
-provider = "ollama"
-name = "qwen2.5-coder-14b"
+provider = "openai"
+# name = "huihui-gemma-4-e4b-it-abliterated"
+name = "gpt-oss:20b"
+baseUrl = "http://localhost:11434/v1"
 # context_length = 32768
 # tool_format = "hermes"
+# timeout = 300   # seconds to wait for model response (default: 300 / 5 min)
 
 [context]
 max_budget_pct = 70
